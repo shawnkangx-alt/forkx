@@ -65,6 +65,22 @@ def _get_conn():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_stock_date ON daily_records(stock_code, record_date)")
+    # 预测记录表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stock_code TEXT NOT NULL,
+            record_date TEXT NOT NULL,  -- 这条记录是哪天的分析
+            predicted_up_prob REAL,
+            predicted_direction TEXT,   -- "up" / "down" / "neutral"
+            actual_up REAL,             -- 次日实际涨跌（事后填入）
+            actual_change_pct REAL,
+            learned INTEGER DEFAULT 0,  -- 是否已用于权重更新
+            created_at TEXT,
+            UNIQUE(stock_code, record_date)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_learned ON predictions(stock_code, learned)")
     conn.commit()
     return conn
 
@@ -171,6 +187,161 @@ def get_records(stock_code: str, days: int = 30) -> List[DailyRecord]:
             composite_signal=r[15] or "", signals=signals, note=r[17] or "",
         ))
     return records
+
+
+def save_prediction(stock_code: str, record_date: date, up_prob: float, direction: str):
+    """保存预测记录（只在没有历史记录时插入）。"""
+    conn = _get_conn()
+    now = datetime.now().isoformat()
+    # 只在不存在时插入（避免覆盖已学习的记录）
+    conn.execute("""
+        INSERT INTO predictions
+        (stock_code, record_date, predicted_up_prob, predicted_direction, actual_up, actual_change_pct, learned, created_at)
+        SELECT ?, ?, ?, ?, NULL, NULL, 0, ?
+        WHERE NOT EXISTS (SELECT 1 FROM predictions WHERE stock_code = ? AND record_date = ?)
+    """, (stock_code, record_date.isoformat(), up_prob, direction, now, stock_code, record_date.isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def learn_from_predictions(stock_code: str) -> dict:
+    """对照未学习的预测记录与实际结果，更新信号权重。
+
+    逻辑：
+    - 找到 learned=0 的预测记录
+    - 找该记录次日（即 record_date 的次日）的实际涨跌（从 daily_records）
+    - 如果预测正确（方向一致）：各信号权重 +0.05
+    - 如果预测错误（方向相反）：各信号权重 -0.10
+    - 标记为 learned=1
+    """
+    from .signal_weights import load_signal_weights, save_signal_weights
+
+    conn = _get_conn()
+    # 找出该股票未学习的预测
+    preds = conn.execute("""
+        SELECT id, record_date, predicted_direction, predicted_up_prob
+        FROM predictions
+        WHERE stock_code = ? AND learned = 0
+        ORDER BY record_date ASC
+    """, (stock_code,)).fetchall()
+    if not preds:
+        conn.close()
+        return {"updated": 0, "correct": 0, "wrong": 0}
+
+    # 获取历史存档（用于找次日实际涨跌）
+    hist_rows = conn.execute("""
+        SELECT record_date, change_pct, signals
+        FROM daily_records
+        WHERE stock_code = ?
+        ORDER BY record_date ASC
+    """, (stock_code,)).fetchall()
+    conn.close()
+
+    if not hist_rows:
+        return {"updated": 0, "correct": 0, "wrong": 0}
+
+    # 构建 date → (change_pct, signals) 映射
+    hist_map = {}
+    signals_by_date = {}
+    for h in hist_rows:
+        d = date.fromisoformat(h[0])
+        hist_map[d] = h[1]
+        signals_by_date[d] = json.loads(h[2]) if h[2] else []
+
+    updated = 0
+    correct = 0
+    wrong = 0
+    changes = []
+
+    weights = load_signal_weights()
+    for pid, pred_date_str, pred_dir, up_prob in preds:
+        pred_date = date.fromisoformat(pred_date_str)
+        # 次日实际涨跌
+        actual_change = hist_map.get(pred_date)
+        if actual_change is None:
+            continue  # 还没到次日，跳过
+        actual_up = actual_change > 0
+        pred_up = pred_dir == "up"
+        is_correct = actual_up == pred_up
+
+        # 获取当时的信号
+        signals = signals_by_date.get(pred_date, [])
+
+        # 修正量
+        delta = 0.05 if is_correct else -0.10
+        sigs_modified = []
+        for sig in signals:
+            old_w = weights.get(sig, SignalWeight(count=0, win=0, total_return=0.0, weight=0.0))
+            # 调整 weight（基础分 ± delta）
+            new_weight = max(0.0, old_w.weight + delta * 100)
+            weights[sig] = SignalWeight(
+                count=old_w.count,
+                win=old_w.win,
+                total_return=old_w.total_return,
+                weight=new_weight
+            )
+            sigs_modified.append((sig, old_w.weight, new_weight))
+
+        # 标记为已学习
+        conn2 = _get_conn()
+        conn2.execute("UPDATE predictions SET learned=1 WHERE id=?", (pid,))
+        conn2.execute("UPDATE predictions SET actual_up=?, actual_change_pct=? WHERE id=?", (1 if actual_up else 0, actual_change, pid))
+        conn2.commit()
+        conn2.close()
+
+        updated += 1
+        if is_correct:
+            correct += 1
+        else:
+            wrong += 1
+        changes.append({
+            "date": pred_date_str,
+            "predicted": pred_dir,
+            "actual": "up" if actual_up else "down",
+            "correct": is_correct,
+            "signals": sigs_modified,
+        })
+
+    save_signal_weights(weights)
+    return {"updated": updated, "correct": correct, "wrong": wrong, "changes": changes}
+
+
+def _direction_to_key(d: str) -> str:
+    """统一方向字符串。"""
+    if d in ("up", "上涨"):
+        return "up"
+    if d in ("down", "下跌"):
+        return "down"
+    return "neutral"
+
+
+def get_prediction_summary(stock_code: str) -> dict:
+    """获取预测准确率统计。"""
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT predicted_direction, actual_up, learned
+        FROM predictions
+        WHERE stock_code = ?
+        ORDER BY record_date DESC
+    """, (stock_code,)).fetchall()
+    conn.close()
+
+    learned = [(p[0], p[1]) for p in rows if p[2] == 1]
+    total = len(learned)
+    if total == 0:
+        return {"total": 0, "accuracy": None, "correct": 0, "wrong": 0}
+
+    correct = sum(
+        1 for pd, au in learned
+        if _direction_to_key(pd) == "up" and au == 1
+        or _direction_to_key(pd) != "up" and au == 0
+    )
+    return {
+        "total": total,
+        "correct": correct,
+        "wrong": total - correct,
+        "accuracy": correct / total if total > 0 else None,
+    }
 
 
 def get_next_day_return(stock_code: str, record_date: date) -> Optional[float]:

@@ -155,6 +155,11 @@ def cmd_analyze(args):
 
             # 加权信号建议（基于历史胜率）
             from .screening.signal_weights import get_weighted_advice, update_signal_weights
+            from .screening.history_store import learn_from_predictions, get_prediction_summary
+            # 先学习（对照昨日预测 vs 今日实际）
+            lr = learn_from_predictions(code)
+            if lr["updated"] > 0:
+                print(f"  [学习反馈] 更新 {lr['updated']} 条  ✓{lr['correct']} / ✗{lr['wrong']}")
             update_signal_weights()
             level, advice = get_weighted_advice(today_signals)
             if today_signals:
@@ -170,9 +175,26 @@ def cmd_analyze(args):
 
 def cmd_predict(args):
     from .screening.predictor import predict_next_day, format_prediction
+    from .screening.history_store import save_prediction, learn_from_predictions, get_prediction_summary
     code = args.stock
+
+    # 先触发学习反馈（对照昨日预测 vs 今日实际）
+    learn_result = learn_from_predictions(code)
+    if learn_result["updated"] > 0:
+        print(f"\n  [学习反馈] 更新了 {learn_result['updated']} 条预测记录  "
+              f"✓{learn_result['correct']} / ✗{learn_result['wrong']}")
+
+    # 执行预测并保存
     pred = predict_next_day(code)
+    today = date.today()
+    save_prediction(code, today, pred["up_prob"], pred["prediction"])
+
+    # 预测准确率统计
+    summary = get_prediction_summary(code)
+    acc_str = f"{summary['accuracy']:.0%}" if summary["accuracy"] is not None else "无数据"
+
     print(format_prediction(pred))
+    print(f"\n  [历史准确率] {acc_str}（{summary['total']} 笔已学习）")
 
 
 def cmd_chart(args):

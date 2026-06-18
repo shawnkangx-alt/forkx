@@ -122,93 +122,82 @@ def _naive_bayes_predict(
     new_f: dict,
     all_signals: List[str],
 ) -> Dict:
-    """朴素贝叶斯预测。
+    """朴素贝叶斯预测（简化版）。
 
     计算 P(up | features) ∝ P(features | up) * P(up)
-    使用拉普拉斯平滑。
+    使用拉普拉斯平滑。用打分制替代 log。
     """
+    import math
     n = len(labels)
     if n == 0:
         return _default_prediction()
 
     up_count = sum(labels)
     p_up = up_count / n  # P(up)
-    p_down = 1 - p_up
-
-    # 拉普拉斯平滑参数
     alpha = 1.0
 
-    # 各特征的 P(feature | up) 和 P(feature | down)
     sig_features = {k: v for k, v in new_f.items() if k.startswith("sig_")}
 
-    log_p_up = (up_count / n).bit_length()  # 近似log
-    log_p_up_score = 0.0
-    log_p_down_score = 0.0
+    bayes_score = 0.0  # 正数偏向上涨，负数偏向下跌
 
-    # 信号特征的贝叶斯更新
     for fname, fval in sig_features.items():
-        f_up_yes = sum(1 for i, f in enumerate(features) if f.get(fname, 0) == 1 and labels[i] == 1)
-        f_up_no = sum(1 for i, f in enumerate(features) if f.get(fname, 1) == 0 and labels[i] == 0)
-        n_up = up_count
+        # 统计有这个信号时上涨/下跌的次数
+        f_up_yes = sum(1 for i in range(n) if features[i].get(fname, 0) == 1 and labels[i] == 1)
+        f_down_yes = sum(1 for i in range(n) if features[i].get(fname, 0) == 1 and labels[i] == 0)
+        total_with_signal = f_up_yes + f_down_yes
 
-        # P(feature=1 | up)
-        p_f_given_up = (f_up_yes + alpha) / (n_up + 2 * alpha)
-        # P(feature=1 | down)
-        p_f_given_down = ((sum(1 for i, f in enumerate(features) if f.get(fname, 0) == 1 and labels[i] == 0)) + alpha) / ((n - up_count) + 2 * alpha)
+        if total_with_signal == 0:
+            continue
 
+        p_up_given_sig = (f_up_yes + alpha) / (total_with_signal + 2 * alpha)
         if fval == 1:
-            log_p_up_score += (p_f_given_up + 1e-9).bit_length()
-            log_p_down_score += (p_f_given_down + 1e-9).bit_length()
+            bayes_score += p_up_given_sig - 0.5
         else:
-            log_p_up_score += ((1 - p_f_given_up) + 1e-9).bit_length()
-            log_p_down_score += ((1 - p_f_given_down) + 1e-9).bit_length()
+            bayes_score += (1 - p_up_given_sig) - 0.5
 
-    # 结合 RSI、量比、资金流的简单规则修正
+    # RSI 修正
     rsi_mod = 0.0
     if new_f.get("rsi_low", 0) == 1:
-        rsi_mod = +0.15  # RSI低 → 上涨概率上调
+        rsi_mod = +0.15
     elif new_f.get("rsi_high", 0) == 1:
-        rsi_mod = -0.10  # RSI高 → 上涨概率下调
+        rsi_mod = -0.10
 
+    # 量比修正
     vol_mod = 0.0
     if new_f.get("vol_low", 0) == 1:
-        vol_mod = +0.05  # 缩量 → 偏多（卖压轻）
+        vol_mod = +0.05
     elif new_f.get("vol_high", 0) == 1:
-        vol_mod = -0.05  # 放量 → 偏空
+        vol_mod = -0.05
 
+    # 资金流修正
     fund_mod = 0.0
     if new_f.get("fund_in", 0) == 1:
-        fund_mod = +0.15  # 主力流入 → 上涨概率上调
+        fund_mod = +0.15
     elif new_f.get("fund_out", 0) == 1:
-        fund_mod = -0.15  # 主力流出 → 下调
+        fund_mod = -0.15
+
+    # MA 多空修正
+    ma_mod = 0.0
+    if new_f.get("ma_bull", 0) == 1:
+        ma_mod = +0.10
+    elif new_f.get("ma_bear", 0) == 1:
+        ma_mod = -0.10
 
     # 综合概率
-    # 用打分制：基础分 = P(up)，然后用规则修正
-    raw_prob = p_up + rsi_mod + vol_mod + fund_mod
-    up_prob = max(0.05, min(0.95, raw_prob))
+    raw = p_up + bayes_score * 0.3 + rsi_mod + vol_mod + fund_mod + ma_mod
+    up_prob = max(0.05, min(0.95, raw))
 
     # 关键信号
     key = []
-    if new_f.get("sig_趋势强势"):
-        key.append("趋势强势")
-    if new_f.get("sig_RSI超卖"):
-        key.append("RSI超卖")
-    if new_f.get("sig_RSI偏弱"):
-        key.append("RSI偏弱")
-    if new_f.get("sig_主力强势吸筹"):
-        key.append("主力强势吸筹")
-    if new_f.get("sig_主力温和吸筹"):
-        key.append("主力温和吸筹")
-    if new_f.get("sig_横盘向上突破"):
-        key.append("横盘向上突破")
-    if new_f.get("sig_MACD金叉"):
-        key.append("MACD金叉")
-    if new_f.get("sig_资金由卖转买"):
-        key.append("资金由卖转买")
-    if new_f.get("sig_尾盘偷袭"):
-        key.append("尾盘偷袭（偏弱）")
-    if new_f.get("sig_主力派发"):
-        key.append("主力派发（偏空）")
+    for sig_key in ["sig_趋势强势", "sig_RSI超卖", "sig_RSI偏弱", "sig_主力强势吸筹",
+                    "sig_横盘向上突破", "sig_MACD金叉", "sig_资金由卖转买",
+                    "sig_尾盘偷袭", "sig_主力派发"]:
+        if new_f.get(sig_key, 0) == 1:
+            key.append(sig_key.replace("sig_", ""))
+    if new_f.get("sig_RSI超买", 0) == 1:
+        key.append("RSI超买（偏空）")
+    if new_f.get("sig_RSI偏强", 0) == 1:
+        key.append("RSI偏强（偏空）")
 
     return {
         "up_prob": up_prob,
