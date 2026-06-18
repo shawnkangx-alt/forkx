@@ -1,0 +1,3 @@
+#!/bin/bash
+export PYTHONPATH=/Users/shawnkangx/projects/forkx
+exec python3 -m forkx.code.main "$@"
