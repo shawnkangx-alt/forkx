@@ -23,19 +23,33 @@ def _get_conn():
             volume REAL NOT NULL,
             trade_date TEXT NOT NULL,
             note TEXT DEFAULT '',
+            signals TEXT DEFAULT '',
             created_at TEXT NOT NULL
         )
     """)
+    # Migration: add signals column if missing (existing table has 8 cols)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN signals TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
 
 def add_trade(trade: TradeRecord) -> str:
     conn = _get_conn()
+    # Ensure signals column exists (migration for existing tables)
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN signals TEXT DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # already exists
+    signals_json = json.dumps(trade.signals) if trade.signals else ""
     conn.execute(
-        "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO trades (id, stock_code, action, price, volume, trade_date, note, signals, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (trade.id, trade.stock_code, trade.action, trade.price,
-         trade.volume, trade.date.isoformat(), trade.note, trade.created_at.isoformat())
+         trade.volume, trade.date.isoformat(), trade.note, signals_json,
+         trade.created_at.isoformat())
     )
     conn.commit()
     conn.close()
@@ -46,21 +60,35 @@ def list_trades(stock_code: Optional[str] = None) -> List[TradeRecord]:
     conn = _get_conn()
     if stock_code:
         rows = conn.execute(
-            "SELECT * FROM trades WHERE stock_code = ? ORDER BY trade_date DESC",
+            "SELECT id, stock_code, action, price, volume, trade_date, note, signals, created_at FROM trades WHERE stock_code = ? ORDER BY trade_date DESC",
             (stock_code,)
         ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM trades ORDER BY trade_date DESC").fetchall()
+        rows = conn.execute("SELECT id, stock_code, action, price, volume, trade_date, note, signals, created_at FROM trades ORDER BY trade_date DESC").fetchall()
     conn.close()
     return [_row_to_trade(r) for r in rows]
 
 
 def _row_to_trade(row) -> TradeRecord:
-    return TradeRecord(
-        id=row[0], stock_code=row[1], action=row[2],
-        price=row[3], volume=row[4],
-        date=date.fromisoformat(row[5]), note=row[6],
-    )
+    import json as _json
+    # Handle both old rows (8 cols) and new rows (9 cols with signals)
+    if len(row) >= 9:
+        signals_raw = row[7] if row[7] else ""
+        signals = _json.loads(signals_raw) if signals_raw else []
+        return TradeRecord(
+            id=row[0], stock_code=row[1], action=row[2],
+            price=row[3], volume=row[4],
+            date=date.fromisoformat(row[5]), note=row[6] or "",
+            signals=signals,
+        )
+    else:
+        # Old format: no signals column
+        return TradeRecord(
+            id=row[0], stock_code=row[1], action=row[2],
+            price=row[3], volume=row[4],
+            date=date.fromisoformat(row[5]), note=row[6] or "",
+            signals=[],
+        )
 
 
 def get_positions() -> List[dict]:

@@ -166,6 +166,15 @@ def cmd_compare(args):
 
 def cmd_log(args):
     if args.action == "add":
+        # 自动提取信号（除非手动指定）
+        auto_signals = []
+        if not getattr(args, 'signals', None):
+            try:
+                from .screening.signal_extractor import extract_current_signals
+                auto_signals = extract_current_signals(args.stock)
+            except Exception:
+                pass
+
         trade = TradeRecord(
             stock_code=args.stock,
             action=args.action_type,
@@ -173,16 +182,22 @@ def cmd_log(args):
             volume=float(args.volume),
             date=date.fromisoformat(args.date),
             note=args.note or "",
+            signals=auto_signals,
         )
         tid = add_trade(trade)
+        sig_text = " | ".join(auto_signals) if auto_signals else "（无信号）"
         print(f"已记录 [{tid}]：{args.action_type.upper()} {args.stock} {args.volume}股 @{args.price}")
+        print(f"  信号：{sig_text}")
     elif args.action == "list":
         trades = list_trades(stock_code=args.stock)
         if not trades:
             print("暂无交易记录")
             return
         for t in trades:
-            print(f"{t.date}  {t.action.upper():>4}  {t.stock_code}  {t.volume}股 @{t.price:.2f}  {t.note}")
+            sig_str = f"  [{', '.join(t.signals)}]" if t.signals else ""
+            print(f"{t.date}  {t.action.upper():>4}  {t.stock_code}  {t.volume}股 @{t.price:.2f}{sig_str}")
+            if t.note:
+                print(f"    备注：{t.note}")
     elif args.action == "positions":
         positions = get_positions()
         if not positions:
