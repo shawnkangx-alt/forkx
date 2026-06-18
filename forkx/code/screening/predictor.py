@@ -1,287 +1,281 @@
-"""个股次日涨跌预测模型。
+"""个股次日涨跌预测模型 v2 — 富特征集版。
 
-基于历史存档数据，学习信号与次日涨跌的关联概率。
-当前数据不足时使用朴素贝叶斯；数据充足时使用逻辑回归。
+基于 60+ 维技术特征（趋势/动量/量能/位置/形态/相对强弱），
+学习历史模式，预测次日涨跌概率。
 
-核心逻辑：
-- 特征：信号标签（bool）+ RSI区间 + 量比区间 + 资金流方向
-- 标签：次日涨跌（涨=1，跌=0）
-- 方法：朴素贝叶斯（样本少时） / 逻辑回归（样本多时）
+特征维度（60+）：
+  MA类（9）：ma5_above_ma10/ma20、ma_bull/bear排列、ma5/20斜率、乖离率、金叉死叉
+  RSI类（13）：数值、50之上/超买/超卖/中性/上升、5区间、底背离/顶背离
+  MACD类（5）：快线正负、histogram方向/递增、金叉/死叉
+  布林带类（4）：position、上轨碰触、下轨碰触、收缩
+  ATR类（1）：ATR/价格比
+  OBV类（2）：上升、趋势
+  动量类（3）：方向、加速、10日动量值
+  量能类（5）：量比、量比高/低、5日均量对比、量价背离
+  位置类（6）：距高低点、振幅、连续涨跌、5/10/20日收益率
+  大盘类（1）：相对强弱
+  信号类（26）：原始26种信号标签
 
 使用方式：
     pred = predict_next_day('002371')
     print(f"上涨概率: {pred['up_prob']:.0%}")
-    print(f"预测: {pred['prediction']} ({pred['confidence']})")
-    print(f"关键信号: {pred['key_signals']}")
 """
 import json
 import sqlite3
-from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .feature_engineering import (
+    calc_all_features, calc_rsi, calc_ema, calc_macd, calc_bollinger,
+    calc_atr, calc_obv, calc_momentum, calc_volume_ratio,
+    detect_rsi_divergence, detect_ma_cross, detect_volume_price_divergence,
+    calc_support_resistance, calc_consecutive_days, calc_near_high_low,
+    calc_amplitude, calc_relative_strength, get_market_index,
+)
+from ..data.sina_provider import SinaProvider
+from ..data.models import DailyQuote
+
 _DB_PATH = Path.home() / ".forkx" / "history.db"
 _TRADE_DB = Path.home() / ".forkx" / "trades.db"
-_MIN_RECORDS = 20   # 最少需要的历史记录数
+_MIN_RECORDS = 20
 
 
-def get_stock_records(stock_code: str, lookback: int = 120) -> List[dict]:
-    """获取历史存档记录。"""
-    if not _DB_PATH.exists():
-        return []
-    conn = sqlite3.connect(str(_DB_PATH))
-    rows = conn.execute("""
-        SELECT record_date, close, change_pct, volume_ratio, rsi, rsi_zone,
-               ma_status, fund_flow_net_wan, fund_flow_trend, signals
-        FROM daily_records
-        WHERE stock_code = ?
-        ORDER BY record_date ASC
-        LIMIT ?
-    """, (stock_code, lookback)).fetchall()
-    conn.close()
+# =============================================================================
+# 特征构建
+# =============================================================================
 
-    records = []
-    for r in rows:
-        signals = json.loads(r[9]) if r[9] else []
-        records.append({
-            "date": date.fromisoformat(r[0]),
-            "close": r[1],
-            "change_pct": r[2] or 0.0,
-            "volume_ratio": r[3] or 1.0,
-            "rsi": r[4] or 50.0,
-            "rsi_zone": r[5] or "",
-            "ma_status": r[6] or "",
-            "fund_flow_net_wan": r[7] or 0.0,
-            "fund_flow_trend": r[8] or "",
-            "signals": signals,
-        })
-    return records
+def _quote_to_dict(q: DailyQuote) -> dict:
+    return {
+        "date": q.date,
+        "open": q.open,
+        "high": q.high,
+        "low": q.low,
+        "close": q.close,
+        "volume": q.volume,
+        "change_pct": getattr(q, "change_pct", 0.0),
+    }
 
 
-def _build_features(rec: dict) -> dict:
-    """从记录构建特征向量。"""
-    f = {}
+def _build_rich_features(quotes: List[DailyQuote], stock_code: str) -> Tuple[List[dict], List[int]]:
+    """为每条历史记录构建富特征集，返回 (features_list, labels)。
 
-    # 信号特征（bool）
-    SIGNAL_FEATURES = [
-        "趋势强势", "趋势弱势", "趋势反转",
-        "RSI超买", "RSI偏强", "RSI中性", "RSI偏弱", "RSI超卖",
-        "MACD金叉", "MACD死叉",
-        "主力强势吸筹", "主力温和吸筹", "主力派发", "资金由卖转买",
-        "横盘向上突破", "横盘向下突破",
-        "尾盘偷袭", "放量异动", "缩量整理",
-        "竞价试盘", "竞价护盘", "竞价派发",
-    ]
-    for sig in SIGNAL_FEATURES:
-        f[f"sig_{sig}"] = 1 if sig in rec.get("signals", []) else 0
-
-    # RSI 数值
-    f["rsi"] = rec.get("rsi", 50.0)
-    f["rsi_high"] = 1 if f["rsi"] > 70 else 0
-    f["rsi_low"] = 1 if f["rsi"] < 30 else 0
-    f["rsi_mid"] = 1 if 40 <= f["rsi"] <= 60 else 0
-
-    # 量比
-    f["vol_ratio"] = rec.get("volume_ratio", 1.0)
-    f["vol_high"] = 1 if f["vol_ratio"] > 1.5 else 0
-    f["vol_low"] = 1 if f["vol_ratio"] < 0.7 else 0
-
-    # 资金流
-    f["fund_flow"] = rec.get("fund_flow_net_wan", 0.0)
-    f["fund_in"] = 1 if f["fund_flow"] > 1000 else 0
-    f["fund_out"] = 1 if f["fund_flow"] < -1000 else 0
-
-    # MA多头
-    f["ma_bull"] = 1 if "多头" in rec.get("ma_status", "") else 0
-    f["ma_bear"] = 1 if "空头" in rec.get("ma_status", "") else 0
-
-    return f
-
-
-def _build_dataset(records: List[dict]) -> Tuple[List[dict], List[int]]:
-    """从记录列表构建特征矩阵和标签向量。
-
-    标签：次日涨跌（>0 → 1，<0 → 0，==0 → 取决于前一日方向）
+    labels：次日涨跌（>0 → 1，<0 → 0）
     """
-    features, labels = [], []
-    for i in range(len(records) - 1):
-        curr = records[i]
-        next_rec = records[i + 1]
-        # 次日涨跌
-        label = 1 if next_rec["change_pct"] > 0 else 0
-        f = _build_features(curr)
-        features.append(f)
-        labels.append(label)
-    return features, labels
+    if len(quotes) < 25:
+        return [], []
 
+    features_list = []
+    labels = []
 
-def _naive_bayes_predict(
-    features: List[dict],
-    labels: List[int],
-    new_f: dict,
-    all_signals: List[str],
-) -> Dict:
-    """朴素贝叶斯预测（简化版）。
+    # 对每条记录，取其之前N天数据计算特征
+    lookback = 60  # 用过去60天数据计算特征
+    for i in range(lookback, len(quotes) - 1):
+        hist_quotes = quotes[i - lookback:i + 1]  # 含当天
+        curr = quotes[i]
+        next_q = quotes[i + 1]
 
-    计算 P(up | features) ∝ P(features | up) * P(up)
-    使用拉普拉斯平滑。用打分制替代 log。
-    """
-    import math
-    n = len(labels)
-    if n == 0:
-        return _default_prediction()
-
-    up_count = sum(labels)
-    p_up = up_count / n  # P(up)
-    alpha = 1.0
-
-    sig_features = {k: v for k, v in new_f.items() if k.startswith("sig_")}
-
-    bayes_score = 0.0  # 正数偏向上涨，负数偏向下跌
-
-    for fname, fval in sig_features.items():
-        # 统计有这个信号时上涨/下跌的次数
-        f_up_yes = sum(1 for i in range(n) if features[i].get(fname, 0) == 1 and labels[i] == 1)
-        f_down_yes = sum(1 for i in range(n) if features[i].get(fname, 0) == 1 and labels[i] == 0)
-        total_with_signal = f_up_yes + f_down_yes
-
-        if total_with_signal == 0:
+        # 计算特征
+        f = calc_all_features(stock_code, hist_quotes)
+        if not f:
             continue
 
-        p_up_given_sig = (f_up_yes + alpha) / (total_with_signal + 2 * alpha)
-        if fval == 1:
-            bayes_score += p_up_given_sig - 0.5
+        # 追加基础字段
+        f["change_pct_today"] = curr.change_pct if hasattr(curr, "change_pct") else 0.0
+        f["volume_today"] = curr.volume
+
+        features_list.append(f)
+        labels.append(1 if next_q.close > curr.close else 0)
+
+    return features_list, labels
+
+
+def _build_current_features(stock_code: str, quotes: List[DailyQuote]) -> dict:
+    """为最新一天构建特征。"""
+    if len(quotes) < 25:
+        return {}
+    lookback = 60
+    return calc_all_features(stock_code, quotes[-lookback:])
+
+
+# =============================================================================
+# 朴素贝叶斯预测（打分制）
+# =============================================================================
+
+def _bayesian_predict(
+    features_list: List[dict],
+    labels: List[int],
+    current_f: dict,
+) -> Dict:
+    """贝叶斯打分预测 v2。
+
+    对每个特征（布尔），计算 P(up|feature=1) 和 P(up|feature=0)。
+    用 odds ratio 累加：
+      当前有这个特征 → 加上 (p_up_given_1 - 0.5)
+      当前没有这个特征 → 加上 (p_up_given_0 - 0.5)
+    最终用 sigmoid 压缩到 [0.05, 0.95]。
+    """
+    n = len(labels)
+    if n == 0:
+        return _default_pred()
+
+    up_count = sum(labels)
+    p_up_base = up_count / n  # 先验 P(up)
+    alpha = 1.0
+
+    # 所有布尔特征（从 current_f 推断）
+    bool_feature_names = set()
+    for fd in features_list:
+        bool_feature_names.update(fd.keys())
+    bool_feature_names = {k for k in bool_feature_names
+                         if k.startswith("sig_") or k in (
+                             "ma5_above_ma10", "ma5_above_ma20", "ma10_above_ma20",
+                             "ma_bull_alignment", "ma_bear_alignment",
+                             "ma_golden_cross", "ma_death_cross",
+                             "ma_bullish_arrangement", "ma_bearish_arrangement",
+                             "rsi_above_50", "rsi_overbought", "rsi_oversold",
+                             "rsi_neutral", "rsi_rising",
+                             "rsi_zone_oversold", "rsi_zone_low", "rsi_zone_mid",
+                             "rsi_zone_high", "rsi_zone_overbought",
+                             "rsi_divergence_bottom", "rsi_divergence_top",
+                             "macd_positive", "macd_histogram_positive",
+                             "macd_histogram_increasing",
+                             "macd_golden_cross", "macd_death_cross",
+                             "bb_upper_touch", "bb_lower_touch", "bb_squeeze",
+                             "obv_rising", "obv_trend",
+                             "momentum_positive", "momentum_accelerating",
+                             "vol_ratio_high", "vol_ratio_low",
+                             "vp_divergence_up", "vp_divergence_down",
+                         )}
+
+    score = 0.0
+    feature_impacts = []  # [(fname, impact, direction_str), ...]
+
+    for fname in bool_feature_names:
+        # 统计
+        f1_up = sum(1 for i, fd in enumerate(features_list) if fd.get(fname, 0) == 1 and labels[i] == 1)
+        f1_total = sum(1 for fd in features_list if fd.get(fname, 0) == 1)
+        f0_up = sum(1 for i, fd in enumerate(features_list) if fd.get(fname, 0) == 0 and labels[i] == 1)
+        f0_total = sum(1 for fd in features_list if fd.get(fname, 0) == 0)
+
+        if f1_total < 3 and f0_total < 3:
+            continue  # 样本太少
+
+        # P(up|feature=1) 和 P(up|feature=0)，拉普拉斯平滑
+        p_up_1 = (f1_up + alpha) / (f1_total + 2 * alpha)
+        p_up_0 = (f0_up + alpha) / (f0_total + 2 * alpha)
+
+        # 当前值对打分的影响
+        curr_val = current_f.get(fname, 0)
+        if curr_val == 1:
+            impact = p_up_1 - 0.5
+            score += impact
         else:
-            bayes_score += (1 - p_up_given_sig) - 0.5
+            impact = p_up_0 - 0.5
+            score += impact
 
-    # RSI 修正
-    rsi_mod = 0.0
-    if new_f.get("rsi_low", 0) == 1:
-        rsi_mod = +0.15
-    elif new_f.get("rsi_high", 0) == 1:
-        rsi_mod = -0.10
+        # 记录（用于展示）
+        if f1_total >= 3:
+            freq = f1_total / n
+            feature_impacts.append((fname, impact, "↑" if impact > 0 else "↓", freq))
 
-    # 量比修正
-    vol_mod = 0.0
-    if new_f.get("vol_low", 0) == 1:
-        vol_mod = +0.05
-    elif new_f.get("vol_high", 0) == 1:
-        vol_mod = -0.05
+    # sigmoid 压缩到概率
+    import math
+    prob = 1 / (1 + math.exp(-score * 4))
+    up_prob = max(0.05, min(0.95, prob))
 
-    # 资金流修正
-    fund_mod = 0.0
-    if new_f.get("fund_in", 0) == 1:
-        fund_mod = +0.15
-    elif new_f.get("fund_out", 0) == 1:
-        fund_mod = -0.15
-
-    # MA 多空修正
-    ma_mod = 0.0
-    if new_f.get("ma_bull", 0) == 1:
-        ma_mod = +0.10
-    elif new_f.get("ma_bear", 0) == 1:
-        ma_mod = -0.10
-
-    # 综合概率
-    raw = p_up + bayes_score * 0.3 + rsi_mod + vol_mod + fund_mod + ma_mod
-    up_prob = max(0.05, min(0.95, raw))
+    # 排序最重要的特征（按影响幅度 * 频率）
+    feature_impacts.sort(key=lambda x: abs(x[1]) * x[3], reverse=True)
+    top_features = feature_impacts[:10]
 
     # 关键信号
-    key = []
-    for sig_key in ["sig_趋势强势", "sig_RSI超卖", "sig_RSI偏弱", "sig_主力强势吸筹",
-                    "sig_横盘向上突破", "sig_MACD金叉", "sig_资金由卖转买",
-                    "sig_尾盘偷袭", "sig_主力派发"]:
-        if new_f.get(sig_key, 0) == 1:
-            key.append(sig_key.replace("sig_", ""))
-    if new_f.get("sig_RSI超买", 0) == 1:
-        key.append("RSI超买（偏空）")
-    if new_f.get("sig_RSI偏强", 0) == 1:
-        key.append("RSI偏强（偏空）")
+    sig_features = [(k.replace("sig_", ""), v) for k, v in current_f.items()
+                    if k.startswith("sig_") and v == 1]
+    sig_features.sort(key=lambda x: abs(
+        sum(1 for i, fd in enumerate(features_list)
+            if fd.get(f"sig_{x[0]}", 0) == 1 and labels[i] == 1) /
+        max(1, sum(1 for fd in features_list if fd.get(f"sig_{x[0]}", 0) == 1)) - 0.5
+    ), reverse=True)
+    key_signals = [s[0] for s in sig_features[:5]]
 
     return {
         "up_prob": up_prob,
         "down_prob": 1 - up_prob,
         "prediction": "上涨" if up_prob > 0.5 else "下跌",
-        "confidence": _confidence_label(n),
-        "key_signals": key[:5],
-        "model_type": "naive_bayes",
+        "confidence": _conf_label(n),
+        "key_signals": key_signals,
+        "top_features": [(f[0], f[2], f"{f[1]:+.3f}") for f in top_features],
+        "model_type": "bayesian_rich",
         "sample_count": n,
     }
 
 
-def _default_prediction() -> Dict:
+def _conf_label(n: int) -> str:
+    if n < 20:
+        return f"低（数据{n}天，需20天）"
+    elif n < 60:
+        return f"中（数据{n}天）"
+    else:
+        return f"高（数据{n}天）"
+
+
+def _default_pred() -> Dict:
     return {
         "up_prob": 0.50,
         "down_prob": 0.50,
         "prediction": "中性",
         "confidence": "数据不足",
         "key_signals": [],
+        "top_features": [],
         "model_type": "default",
         "sample_count": 0,
     }
 
 
-def _confidence_label(n: int) -> str:
-    if n < 20:
-        return "低（数据少）"
-    elif n < 60:
-        return "中"
-    else:
-        return "高"
-
+# =============================================================================
+# 主预测入口
+# =============================================================================
 
 def predict_next_day(stock_code: str) -> Dict:
-    """对单只股票预测次日涨跌概率。"""
-    records = get_stock_records(stock_code)
-    if len(records) < _MIN_RECORDS:
-        # 数据不足，用最新信号做规则预测
-        if not records:
-            return _default_prediction()
-        latest = records[-1]
-        f = _build_features(latest)
-        # 仅基于最新信号估计（无历史统计）
-        up_signals = ["趋势强势", "RSI超卖", "RSI偏弱", "主力强势吸筹",
-                      "横盘向上突破", "MACD金叉", "资金由卖转买"]
-        down_signals = ["趋势弱势", "RSI超买", "RSI偏强", "主力派发",
-                        "尾盘偷袭", "MACD死叉"]
-        up_score = sum(1 for s in up_signals if any(s in sig for sig in latest.get("signals", [])))
-        down_score = sum(1 for s in down_signals if any(s in sig for sig in latest.get("signals", [])))
-        prob = 0.5 + (up_score - down_score) * 0.05
-        prob = max(0.1, min(0.9, prob))
-        return {
-            "up_prob": prob,
-            "down_prob": 1 - prob,
-            "prediction": "上涨" if prob > 0.5 else "下跌",
-            "confidence": f"低（历史数据{len(records)}天，需{_MIN_RECORDS}天）",
-            "key_signals": latest.get("signals", [])[:5],
-            "model_type": "rule_based",
-            "sample_count": len(records),
-        }
+    """预测次日涨跌。"""
+    today = date.today()
+    start = today - timedelta(days=180)
 
-    # 构建数据集
-    feat_list, label_list = _build_dataset(records)
-    latest = records[-1]
-    new_f = _build_features(latest)
+    # 获取历史K线
+    try:
+        quotes = SinaProvider().get_daily_quotes(stock_code, start, today)
+        quotes = [q for q in quotes if q.date <= today]
+    except Exception:
+        return _default_pred()
 
-    # 用朴素贝叶斯
-    pred = _naive_bayes_predict(feat_list, label_list, new_f, [])
+    if len(quotes) < _MIN_RECORDS + 5:
+        return _default_pred()
 
-    # 添加参考信息
-    # 近5日实际涨跌
-    recent_changes = [r["change_pct"] for r in records[-5:]]
-    pred["recent_5d"] = recent_changes
-    pred["recent_trend"] = "上涨为主" if sum(recent_changes) > 0 else "下跌为主"
+    # 构建特征
+    feat_list, label_list = _build_rich_features(quotes, stock_code)
+    current_f = _build_current_features(stock_code, quotes)
+
+    if len(feat_list) < 5:
+        return _default_pred()
+
+    # 预测
+    pred = _bayesian_predict(feat_list, label_list, current_f)
+
+    # 近5日涨跌
+    recent = [(quotes[i+1].close - quotes[i].close) / quotes[i].close * 100
+              for i in range(len(quotes) - 6, len(quotes) - 1)]
+    pred["recent_5d"] = recent
+    pred["recent_trend"] = "上涨为主" if sum(recent) > 0 else "下跌为主"
 
     return pred
 
 
 def format_prediction(pred: Dict) -> str:
-    """格式化预测结果。"""
+    """格式化预测结果（富展示版）。"""
     lines = []
-    lines.append(f"{'═' * 52}")
+    lines.append(f"{'═' * 54}")
     lines.append(f"  次日涨跌预测")
-    lines.append(f"{'═' * 52}")
+    lines.append(f"{'═' * 54}")
 
     up_prob = pred["up_prob"]
     n = int(up_prob * 20)
@@ -295,8 +289,18 @@ def format_prediction(pred: Dict) -> str:
         changes_str = " / ".join([f"{c:+.1f}%" for c in pred["recent_5d"]])
         lines.append(f"  近5日涨跌  [{changes_str}]  {pred.get('recent_trend', '')}")
 
+    # 关键信号
     if pred.get("key_signals"):
         lines.append(f"  关键信号  {' / '.join(pred['key_signals'])}")
 
-    lines.append(f"{'═' * 52}")
+    # 重要特征拆解
+    if pred.get("top_features"):
+        lines.append(f"{'─' * 54}")
+        lines.append(f"  【特征拆解】（↑=看涨 ↓=看跌）")
+        emoji_map = {"↑": "🔼", "↓": "🔽"}
+        for fname, direction, impact in pred["top_features"][:8]:
+            display_name = fname.replace("_", " ")
+            lines.append(f"  {emoji_map.get(direction, direction)} {display_name:<28} {impact}")
+
+    lines.append(f"{'═' * 54}")
     return "\n".join(lines)
