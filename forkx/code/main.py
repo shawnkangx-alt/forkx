@@ -87,6 +87,9 @@ def cmd_analyze(args):
         print(format_game_report(game, rt.name))
 
         # 资金流（庄家行为直接信号）
+        fund_flow_net_wan = 0.0
+        fund_flow_trend = ""
+        ff = None
         try:
             from .screening.fund_flow_provider import FundFlowProvider, format_fund_flow_summary
             ff = FundFlowProvider().get_fund_flow(code, days=20)
@@ -95,10 +98,81 @@ def cmd_analyze(args):
                 print()
                 print("  【资金流】（庄家行为）")
                 print(ff_text)
+            if ff:
+                fund_flow_net_wan = ff.total_net_wan
+                fund_flow_trend = ff.trend or ""
         except Exception:
             pass
+
+        # 自动存档
+        try:
+            from .screening.signal_extractor import extract_current_signals
+            from .screening.history_store import save_daily_record, DailyRecord
+            today_signals = extract_current_signals(code)
+            # 取今日收盘价（如果今日K线存在）
+            today_quote = next((q for q in quotes if q.date == end), None)
+            close_price = today_quote.close if today_quote else rt.price
+            # 涨跌幅：有实时行情则用实时，否则自己算
+            change = rt.change_pct if hasattr(rt, 'change_pct') and today_quote is None else 0.0
+            if today_quote and len(quotes) >= 2:
+                prev_close = quotes[-2].close
+                change = (today_quote.close - prev_close) / prev_close * 100
+            vol_ratio = rt.volume_ratio if hasattr(rt, 'volume_ratio') else 1.0
+            # RSI
+            from .screening.indicators import calc_rsi, ma_status as _ma_status
+            rsi_vals = calc_rsi([q.close for q in quotes])
+            rsi = rsi_vals[-1] if rsi_vals else 50.0
+            from .screening.indicators import rsi_zone as _rsi_zone
+            rsi_z = _rsi_zone(rsi)
+            ma_s = _ma_status(quotes)
+            # 博弈信号
+            auction_sig = game.auction.signal if game and game.auction else ""
+            intraday_pt = game.intraday_pattern.pattern_type if game and game.intraday_pattern else ""
+            cons_days = game.consolidation.consolidation_days if game and game.consolidation else 0
+            cons_dir = game.consolidation.breakout_direction if game and game.consolidation else ""
+            comp_sig = game.composite_signal if game else ""
+            rec = DailyRecord(
+                stock_code=code,
+                record_date=end,
+                close=close_price,
+                change_pct=change,
+                volume_ratio=vol_ratio,
+                rsi=rsi,
+                rsi_zone=rsi_z,
+                ma_status=ma_s.get("alignment", "") if ma_s else "",
+                macd_signal=comp_sig,
+                fund_flow_net_wan=fund_flow_net_wan,
+                fund_flow_trend=fund_flow_trend,
+                auction_signal=auction_sig,
+                intraday_pattern=intraday_pt,
+                consolidation_days=cons_days,
+                breakout_direction=cons_dir,
+                composite_signal=comp_sig,
+                signals=today_signals,
+            )
+            save_daily_record(rec)
+            print(f"\n  ✓ 已存档 {end} 的分析数据")
+
+            # 加权信号建议（基于历史胜率）
+            from .screening.signal_weights import get_weighted_advice, update_signal_weights
+            update_signal_weights()
+            level, advice = get_weighted_advice(today_signals)
+            if today_signals:
+                print(f"\n  【信号评分】{level} — {advice}")
+                sigs_warn = [s for s in today_signals if s in ("趋势强势", "主力强势吸筹", "RSI超卖", "MACD金叉")]
+                if sigs_warn:
+                    print(f"  强势信号：{', '.join(sigs_warn)}")
+        except Exception as e:
+            print(f"\n  ⚠ 存档失败: {e}")
     except Exception as e:
         print(f"\n[博弈分析暂时不可用: {e}]")
+
+
+def cmd_predict(args):
+    from .screening.predictor import predict_next_day, format_prediction
+    code = args.stock
+    pred = predict_next_day(code)
+    print(format_prediction(pred))
 
 
 def cmd_chart(args):
@@ -212,6 +286,8 @@ def cmd_log(args):
         _print_log_stats()
     elif args.action == "signals":
         _print_signal_stats()
+    elif args.action == "weights":
+        _print_signal_weights()
 
 
 def _print_signal_stats():
@@ -265,6 +341,14 @@ def _print_signal_stats():
     print(f"{'═' * 50}")
 
 
+def _print_signal_weights():
+    """信号权重表。"""
+    from .screening.signal_weights import update_signal_weights, load_signal_weights, format_weights_table
+    update_signal_weights()
+    weights = load_signal_weights()
+    print(format_weights_table(weights))
+
+
 def _print_log_stats():
     """交易统计。"""
     trades = list_trades()
@@ -304,7 +388,7 @@ def cmd_remove(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="forlsx", description="FORKX — 个人炒股助理")
+    parser = argparse.ArgumentParser(prog="forkx", description="FORKX — 个人炒股助理")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("watch", help="查看自选股池状态")
@@ -337,7 +421,7 @@ def main():
     al.add_argument("--id", help="提醒ID")
     al.add_argument("--enabled-only", dest="enabled_only", action="store_true")
     lg = sub.add_parser("log", help="交易记录")
-    lg.add_argument("action", choices=["add", "list", "positions", "stats", "signals"])
+    lg.add_argument("action", choices=["add", "list", "positions", "stats", "signals", "weights"])
     lg.add_argument("--stock", help="股票代码")
     lg.add_argument("--action-type", dest="action_type", choices=["buy", "sell"])
     lg.add_argument("--price", help="成交价格")
@@ -353,6 +437,8 @@ def main():
     co = sub.add_parser("compare", help="多日博弈对比")
     co.add_argument("stock", help="股票代码")
     co.add_argument("--days", default="5", help="对比天数（默认5天）")
+    pr = sub.add_parser("predict", help="次日涨跌预测")
+    pr.add_argument("stock", help="股票代码")
     sub.add_parser("add", help="添加自选股").add_argument("stock", help="股票代码")
     sub.add_parser("remove", help="移除自选股").add_argument("stock", help="股票代码")
 
@@ -371,6 +457,8 @@ def main():
         cmd_backtest(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "predict":
+        cmd_predict(args)
     elif args.command == "add":
         cmd_add(args)
     elif args.command == "remove":
