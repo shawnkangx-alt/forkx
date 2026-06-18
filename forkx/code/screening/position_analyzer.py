@@ -209,34 +209,91 @@ def analyze_position(
         }
 
     else:
-        # === 无持仓分析 ===
-        if pred_up_prob >= 0.75 and pred_confidence in ("高", "中"):
-            advice = "关注"
+        # === 无持仓分析（空仓建议） ===
+        # 计算关键价位
+        risk_pct_val = (current_price - support) / current_price * 100 if support and support < current_price else 5.0
+        reward_pct_val = (pressure - current_price) / current_price * 100 if pressure and pressure > current_price else 10.0
+        rr_ratio = reward_pct_val / risk_pct_val if risk_pct_val > 0 else 0
+        # 建议仓位（单笔风险2%，按止损比例反推）
+        risk_amount = 20000 * 0.02
+        stop_distance = current_price * (risk_pct_val / 100)
+        max_vol = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+        max_shares = min(max_vol, 1000)
+
+        # 根据技术信号强度判断方向
+        # 技术信号得分：RSI<40超卖+1，RSI>70超买+1，MACD金叉+1，资金净流入+1，多头排列+1
+        tech_score = 0
+        if rsi < 40:
+            tech_score += 1
+        elif rsi > 70:
+            tech_score += 1
+        if fund_flow_net > 30000:
+            tech_score += 1
+        trend_bullish = trend in ("多头",)
+        if trend_bullish:
+            tech_score += 1
+
+        # 综合判断：预测概率 + 技术信号
+        effective_prob = pred_up_prob
+        if pred_confidence == "低" and effective_prob == 0.5:
+            # 无有效预测时，用技术信号补充
+            if tech_score >= 3:
+                effective_prob = 0.70
+            elif tech_score >= 2:
+                effective_prob = 0.60
+            elif tech_score >= 1:
+                effective_prob = 0.55
+            else:
+                effective_prob = 0.50
+
+        if effective_prob >= 0.70:
+            advice = "可关注"
             signal = "做多"
             risk = "中"
-            reason.append(f"预测上涨概率{pred_up_prob:.0%}（{pred_confidence}置信度），值得关注")
-            if rsi < 60:
+            reason.append(f"技术信号强（{tech_score}项阳性），值得关注")
+            if rsi < 40:
+                reason.append(f"RSI={rsi:.0f} 超卖，反弹概率大，可分批建仓")
+            elif rsi < 60:
                 reason.append(f"RSI={rsi:.0f} 未超买，有上涨空间")
             if fund_flow_net > 30000:
                 reason.append(f"✓ 主力净流入{fund_flow_net/10000:.0f}万，强势信号")
-            summary = f"暂无持仓，预测看涨（{pred_up_prob:.0%}），{'可关注' if advice == '关注' else advice}"
-        elif pred_up_prob < 0.40:
+            summary = f"暂无持仓，技术面偏多，建议关注（{tech_score}项看多信号）"
+        elif effective_prob >= 0.55:
             advice = "观望"
+            signal = "中性"
+            risk = "中"
+            reason.append(f"技术信号中性（{tech_score}项阳性），方向不明")
+            if rsi > 65:
+                reason.append(f"⚠️ RSI={rsi:.0f} 偏强，追高有风险")
+            summary = f"暂无持仓，方向不明，继续观察（{tech_score}项看多信号）"
+        elif effective_prob < 0.45:
+            advice = "不入场"
             signal = "做空"
             risk = "高"
-            reason.append(f"预测上涨概率仅{pred_up_prob:.0%}，方向偏空，暂不入场")
-            summary = "暂无持仓，预测方向不乐观，观望为主"
+            reason.append(f"技术面偏空（{tech_score}项阳性），方向不利")
+            summary = f"暂无持仓，技术面偏空，等待机会"
+            max_shares = 0
         else:
             advice = "观望"
             signal = "中性"
             risk = "中"
-            reason.append(f"预测上涨概率{pred_up_prob:.0%}，方向不明，继续等待")
+            reason.append("方向不明，继续等待")
             summary = "暂无持仓，方向不明，观望"
+            max_shares = 0
 
+        # RSI超买限制（优先级最高）
         if rsi > 70:
-            reason.append(f"⚠️ RSI={rsi:.0f} 已超买，当前不适合买入")
+            reason = [f"⚠️ RSI={rsi:.0f} 已超买，当前不适合买入"]
             risk = "高"
-            summary += "（RSI超买，谨慎）"
+            advice = "RSI超买，不宜入场"
+            max_shares = 0
+            summary = "暂无持仓，RSI超买，等待回调"
+
+        # 关键价位（买入区间：回落到支撑附近是最佳买点）
+        entry_low = support if support else current_price * 0.97
+        entry_high = current_price
+        stop_loss = support * 0.98 if support else current_price * 0.95
+        target_price = pressure if pressure else current_price * 1.10
 
         return {
             "has_position": False,
@@ -247,6 +304,19 @@ def analyze_position(
             "reason": reason,
             "risk": risk,
             "summary": summary,
+            # 价位字段
+            "current_price": round(current_price, 2),
+            "support": round(support, 2) if support else None,
+            "pressure": round(pressure, 2) if pressure else None,
+            "entry_low": round(entry_low, 2),
+            "entry_high": round(entry_high, 2),
+            "stop_loss": round(stop_loss, 2),
+            "target_price": round(target_price, 2),
+            "risk_pct": round(risk_pct_val, 1),
+            "reward_pct": round(reward_pct_val, 1),
+            "rr_ratio": round(rr_ratio, 1),
+            "max_shares": max_shares,
+            "rsi": round(rsi, 1),
         }
 
 
@@ -265,6 +335,29 @@ def format_position_advice(result: Dict, stock_code: str, current_price: float) 
         lines.append(f"  盈亏      {pnl_emoji} {pnl['pnl']:+.0f} 元（{pnl['pnl_pct']:+.1f}%）")
         lines.append(f"  当前价    {current_price} 元（{'盈利' if pnl['per_share'] > 0 else '亏损'}{abs(pnl['per_share']):.2f}元/股）")
         lines.append(f"{'─' * 54}")
+    else:
+        # 空仓建议：展示关键价位
+        lines.append(f"  当前价    {result.get('current_price', current_price):.2f} 元")
+        if result.get("support"):
+            lines.append(f"  支撑      {result['support']:.2f} 元")
+        if result.get("pressure"):
+            lines.append(f"  压力      {result['pressure']:.2f} 元")
+        lines.append(f"{'─' * 54}")
+        # 操作区间（不入场时不显示）
+        advice = result["advice"]
+        if advice not in ("不入场",):
+            lines.append(f"  建议买点  {result.get('entry_low', 0):.2f} ～ {result.get('entry_high', current_price):.2f} 元")
+            lines.append(f"  止损位    {result.get('stop_loss', 0):.2f} 元（-{result.get('risk_pct', 0):.1f}%）")
+            lines.append(f"  目标位    {result.get('target_price', 0):.2f} 元（+{result.get('reward_pct', 0):.1f}%）")
+            rr = result.get('rr_ratio', 0)
+            rr_emoji = "🟢" if rr >= 2 else ("🟡" if rr >= 1 else "🔴")
+            lines.append(f"  盈亏比    {rr_emoji} {rr:.1f}:1")
+            if result.get("max_shares", 0) > 0:
+                est_cost = result['max_shares'] * result.get('entry_high', current_price)
+                lines.append(f"  建议仓位  最多 {result['max_shares']} 股（约 {est_cost:.0f} 元）")
+            if advice == "观望":
+                lines.append(f"  备注      观望中，等待更佳买点出现再入场")
+        lines.append(f"{'─' * 54}")
 
     # 建议
     advice_color = {
@@ -275,6 +368,9 @@ def format_position_advice(result: Dict, stock_code: str, current_price: float) 
         "止损参考": "🔴",
         "观望": "⚪",
         "关注": "🟢",
+        "可关注": "🟢",
+        "不入场": "🔴",
+        "RSI超买，不宜入场": "🔴",
     }.get(result["advice"], "⚪")
 
     lines.append(f"  操作建议  {advice_color} {result['advice']}")
