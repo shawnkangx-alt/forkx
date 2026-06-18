@@ -167,6 +167,33 @@ def cmd_analyze(args):
                 sigs_warn = [s for s in today_signals if s in ("趋势强势", "主力强势吸筹", "RSI超卖", "MACD金叉")]
                 if sigs_warn:
                     print(f"  强势信号：{', '.join(sigs_warn)}")
+
+            # === 持仓建议 ===
+            from .screening.position_analyzer import analyze_position, format_position_advice
+            from .screening.feature_engineering import calc_support_resistance
+            from .screening.indicators import calc_bollinger
+            closes = [q.close for q in quotes]
+            support, pressure = calc_support_resistance(closes)
+            bb = calc_bollinger(closes)
+            latest = len(closes) - 1
+            bb_upper, bb_lower = bb["upper"][latest], bb["lower"][latest]
+            bb_pos = (close_price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
+            # 趋势判断
+            ma_s_list = ma_s.get("alignment", "") if ma_s else ""
+            trend = "多头" if "多头" in ma_s_list else ("空头" if "空头" in ma_s_list else "震荡")
+            pos_result = analyze_position(
+                stock_code=code,
+                current_price=close_price,
+                pred_up_prob=0.5,  # analyze 不做预测，用中性和历史信号
+                pred_confidence="低",
+                rsi=rsi,
+                bollinger_pos=bb_pos,
+                trend=trend,
+                fund_flow_net=fund_flow_net_wan,
+                support=support,
+                pressure=pressure,
+            )
+            print(format_position_advice(pos_result, code, close_price))
         except Exception as e:
             print(f"\n  ⚠ 存档失败: {e}")
     except Exception as e:
@@ -175,7 +202,7 @@ def cmd_analyze(args):
 
 def cmd_predict(args):
     from .screening.predictor import predict_next_day, format_prediction
-    from .screening.history_store import save_prediction, learn_from_predictions, get_prediction_summary
+    from .screening.history_store import learn_from_predictions, get_prediction_summary
     code = args.stock
 
     # 先触发学习反馈（对照昨日预测 vs 今日实际）
@@ -184,10 +211,8 @@ def cmd_predict(args):
         print(f"\n  [学习反馈] 更新了 {learn_result['updated']} 条预测记录  "
               f"✓{learn_result['correct']} / ✗{learn_result['wrong']}")
 
-    # 执行预测并保存
+    # 执行预测（含保存和学习反馈）
     pred = predict_next_day(code)
-    today = date.today()
-    save_prediction(code, today, pred["up_prob"], pred["prediction"])
 
     # 预测准确率统计
     summary = get_prediction_summary(code)
@@ -195,6 +220,43 @@ def cmd_predict(args):
 
     print(format_prediction(pred))
     print(f"\n  [历史准确率] {acc_str}（{summary['total']} 笔已学习）")
+
+    # === 持仓建议（基于预测结果） ===
+    from .screening.position_analyzer import analyze_position, format_position_advice
+    from .screening.indicators import calc_rsi, calc_bollinger
+    from .screening.feature_engineering import calc_support_resistance
+    # 获取当前行情
+    try:
+        rt_data = _provider()["realtime"].get_realtime([code])
+        rt = rt_data.get(code)
+        current_price = rt.price if rt else 0
+        start = date.today() - timedelta(days=120)
+        quotes_rt = _provider()["kline"].get_daily_quotes(code, start, date.today())
+        if len(quotes_rt) >= 20:
+            closes = [q.close for q in quotes_rt]
+            rsi_vals = calc_rsi(closes)
+            rsi = rsi_vals[-1] if rsi_vals else 50.0
+            support, pressure = calc_support_resistance(closes)
+            bb = calc_bollinger(closes)
+            latest = len(closes) - 1
+            bb_upper, bb_lower = bb["upper"][latest], bb["lower"][latest]
+            bb_pos = (closes[-1] - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
+            pred_confidence = pred.get("confidence", "低")
+            pos_result = analyze_position(
+                stock_code=code,
+                current_price=closes[-1],
+                pred_up_prob=pred.get("up_prob", 0.5),
+                pred_confidence=pred_confidence,
+                rsi=rsi,
+                bollinger_pos=bb_pos,
+                trend="多头",
+                fund_flow_net=0,
+                support=support,
+                pressure=pressure,
+            )
+            print(format_position_advice(pos_result, code, closes[-1]))
+    except Exception:
+        pass  # 持仓建议失败不影响预测输出
 
 
 def cmd_chart(args):
