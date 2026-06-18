@@ -313,6 +313,20 @@ def cmd_alert(args):
         new_state = not target.enabled
         toggle_alert(args.id, new_state)
         print(f"[{args.id}] {'启用' if new_state else '禁用'}")
+    elif args.action == "scan":
+        # 扫描自选股重大变化
+        from .utils.watchlist import load_watchlist
+        from .screening.alert import scan_stock_alerts, format_alert_report, get_stock_name
+        watchlist = load_watchlist()
+        if not watchlist:
+            print("自选股为空，请先添加")
+            return
+        reports = []
+        for code in watchlist:
+            name = get_stock_name(code)
+            rpt = scan_stock_alerts(code, name)
+            reports.append(rpt)
+        print(format_alert_report(reports))
 
 
 def cmd_compare(args):
@@ -485,7 +499,7 @@ def main():
     ch.add_argument("--start", help="起始日期 YYYY-MM-DD")
     ch.add_argument("--end", help="结束日期 YYYY-MM-DD")
     al = sub.add_parser("alert", help="提醒管理")
-    al.add_argument("action", choices=["add", "list", "remove", "check", "toggle"])
+    al.add_argument("action", choices=["add", "list", "remove", "check", "toggle", "scan"])
     al.add_argument("--stock", help="股票代码")
     al.add_argument("--type", dest="alert_type",
                     choices=[
