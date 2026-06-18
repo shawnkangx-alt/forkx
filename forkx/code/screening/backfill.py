@@ -1,10 +1,12 @@
 """历史数据回填脚本。
 
-将北方华创过去N天的历史数据回填到 history_store，
+将股票的历史数据回填到 history_store，
 供预测模型和信号权重学习使用。
 
+数据源：baostock（352+天，无需代理）> 新浪日K（备用）
+
 用法：
-    python -m forkx.code.screening.backfill --stock 002371 --days 90
+    python -m forkx.code.screening.backfill --stock 002371 --days 180
 """
 import argparse
 import sys
@@ -13,6 +15,7 @@ from datetime import date, timedelta
 # 确保项目路径在 sys.path 中
 sys.path.insert(0, '/Users/shawnkangx/projects/forkx')
 
+import baostock as bs
 from forkx.code.data.sina_provider import SinaProvider
 from forkx.code.data.models import DailyQuote
 from forkx.code.screening.indicators import calc_rsi, ma_status, rsi_zone
@@ -25,13 +28,70 @@ from forkx.code.screening.game_analyzer import (
 from forkx.code.data.tencent_provider import TencentProvider
 
 
-def backfill_stock(stock_code: str, days: int = 90) -> dict:
-    """回填单只股票的历史数据。"""
+def _baostock_quotes(stock_code: str, start: date, end: date) -> list:
+    """用 baostock 获取历史日K（352+天，无代理限制）。"""
+    # baostock 的 code 格式：sz.002371 → 去掉前缀
+    bs_code = stock_code.lower()
+    if not bs_code.startswith("sz.") and not bs_code.startswith("sh."):
+        bs_code = "sz." + stock_code if stock_code.startswith("0") else "sh." + stock_code
+
+    bs.login()
+    rs = bs.query_history_k_data_plus(
+        bs_code,
+        'date,open,high,low,close,volume,amount',
+        start_date=start.isoformat(),
+        end_date=end.isoformat(),
+        frequency='d'
+    )
+    rows = rs.get_data()
+    bs.logout()
+
+    if rows.empty:
+        return []
+
+    quotes = []
+    for _, row in rows.iterrows():
+        try:
+            q = DailyQuote(
+                stock_code=stock_code,
+                date=date.fromisoformat(row['date']),
+                open=float(row['open']),
+                high=float(row['high']),
+                low=float(row['low']),
+                close=float(row['close']),
+                volume=float(row['volume']),
+                amount=float(row['amount']) if row['amount'] else 0.0,
+            )
+            quotes.append(q)
+        except (ValueError, KeyError):
+            continue
+    return quotes
+
+
+def backfill_stock(stock_code: str, days: int = 180) -> dict:
+    """回填单只股票的历史数据（优先用 baostock）。"""
     end = date.today()
     start = end - timedelta(days=days + 60)  # 多拿60天作为指标计算缓冲
 
     print(f"获取历史K线 {stock_code} ({start} → {end}) ...")
-    quotes = SinaProvider().get_daily_quotes(stock_code, start, end)
+
+    # 优先用 baostock（352+天，无需代理）
+    quotes = _baostock_quotes(stock_code, start, end)
+    print(f"  baostock: {len(quotes)} 条")
+
+    # 如果 baostock 数据太少，用新浪补充（最新部分）
+    if len(quotes) < days * 0.5:
+        sina_quotes = SinaProvider().get_daily_quotes(stock_code, start, end)
+        print(f"  新浪: {len(sina_quotes)} 条（补充）")
+        if sina_quotes:
+            # 合并，去重（以日期为主，baostock 优先）
+            sina_by_date = {q.date: q for q in sina_quotes}
+            for q in quotes:
+                sina_by_date.pop(q.date, None)
+            quotes.extend(sina_by_date.values())
+            quotes.sort(key=lambda q: q.date)
+            print(f"  合并后: {len(quotes)} 条")
+
     if not quotes:
         print("获取K线失败")
         return {"saved": 0, "skipped": 0}

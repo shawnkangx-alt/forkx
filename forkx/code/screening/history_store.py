@@ -315,6 +315,31 @@ def _direction_to_key(d: str) -> str:
     return "neutral"
 
 
+def get_prediction_records(stock_code: str, days: int = 60) -> List[dict]:
+    """获取预测记录列表（供重训练用）。"""
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT record_date, predicted_up_prob, predicted_direction,
+               actual_up, actual_change_pct, learned
+        FROM predictions
+        WHERE stock_code = ?
+        ORDER BY record_date ASC
+        LIMIT ?
+    """, (stock_code, days)).fetchall()
+    conn.close()
+    return [
+        {
+            "record_date": r[0],
+            "predicted_up_prob": r[1],
+            "predicted_direction": r[2],
+            "actual_up": r[3],
+            "actual_change_pct": r[4],
+            "learned": r[5],
+        }
+        for r in rows
+    ]
+
+
 def get_prediction_summary(stock_code: str) -> dict:
     """获取预测准确率统计。"""
     conn = _get_conn()
