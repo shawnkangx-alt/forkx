@@ -216,7 +216,7 @@ FORKX/
 | `forkx log add/list/positions/stats` | ✅ | 交易记录+持仓+胜率 |
 | `forkx backtest <code>` | ✅ | MA5/20交叉回测（含资金曲线） |
 | `forkx compare <code> [--days N]` | ✅ | 多日博弈状态对比表 |
-| `forkx alert add/list/remove/check/toggle` | ✅ | 提醒管理（传统+博弈信号） |
+| `forkx log signals` | ✅ | 信号胜率统计（按标签统计买入→卖出胜率） |
 | `forkx remove <code>` | ✅ | 移除自选股 |
 
 ## analyze 两层分析体系（2026-06-18）

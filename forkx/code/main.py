@@ -210,37 +210,70 @@ def cmd_log(args):
             print(f"{p['stock_code']:<8} {p['volume']:>10.0f} {p['avg_cost']:>10.2f} {p['trade_count']:>8}")
     elif args.action == "stats":
         _print_log_stats()
+    elif args.action == "signals":
+        _print_signal_stats()
+
+
+def _print_signal_stats():
+    """按信号标签统计胜率。"""
+    from collections import defaultdict
+    trades = list_trades()
+    if not trades:
+        print("暂无交易记录")
+        return
+
+    # 按股票分组，匹配同股票的买→卖交易对
+    stock_trades = defaultdict(list)
+    for t in trades:
+        stock_trades[t.stock_code].append(t)
+
+    # 每只股票：匹配买-卖对，计算每笔卖出的收益率
+    # 买入记录需要价格，卖出时计算相对于最近一次买入的收益率
+    signal_stats = defaultdict(lambda: {"count": 0, "win": 0, "total_return": 0.0})
+
+    for code, recs in stock_trades.items():
+        # 按日期排序
+        recs_sorted = sorted(recs, key=lambda r: r.date)
+        buy_stack = []  # 未平仓的买入
+        for rec in recs_sorted:
+            if rec.action == "buy":
+                buy_stack.append(rec)
+            elif rec.action == "sell" and buy_stack:
+                buy = buy_stack.pop(0)
+                ret_pct = (rec.price - buy.price) / buy.price * 100
+                # 分配信号
+                for sig in buy.signals:
+                    signal_stats[sig]["count"] += 1
+                    signal_stats[sig]["total_return"] += ret_pct
+                    if ret_pct > 0:
+                        signal_stats[sig]["win"] += 1
+
+    if not signal_stats:
+        print("暂无有效交易对（需先有买入→卖出记录）")
+        return
+
+    print(f"{'═' * 50}")
+    print(f"  信号胜率统计")
+    print(f"{'═' * 50}")
+    print(f"{'信号':<20} {'次数':>6} {'胜率':>8} {'平均收益':>10}")
+    print(f"{'-' * 50}")
+    for sig, s in sorted(signal_stats.items(), key=lambda x: -x[1]["count"]):
+        win_rate = s["win"] / s["count"] * 100 if s["count"] > 0 else 0
+        avg_ret = s["total_return"] / s["count"] if s["count"] > 0 else 0
+        bar = "█" * int(win_rate / 10) + "░" * (10 - int(win_rate / 10))
+        print(f"{sig:<18} {s['count']:>6}  {bar} {win_rate:>5.0f}%  {avg_ret:>+7.1f}%")
+    print(f"{'═' * 50}")
 
 
 def _print_log_stats():
-    """胜率统计。"""
+    """交易统计。"""
     trades = list_trades()
     if not trades:
         print("暂无交易记录")
         return
     buys = [t for t in trades if t.action == "buy"]
     sells = [t for t in trades if t.action == "sell"]
-    # 按股票统计
-    from collections import defaultdict
-    stock_stats = defaultdict(lambda: {"buy_count": 0, "sell_count": 0, "volumes": [], "prices": []})
-    for t in trades:
-        s = stock_stats[t.stock_code]
-        s["volumes"].append(t.volume)
-        s["prices"].append(t.price)
-        if t.action == "buy":
-            s["buy_count"] += 1
-        else:
-            s["sell_count"] += 1
-
-    total_trades = len(trades)
-    buy_count = len(buys)
-    sell_count = len(sells)
-    print(f"总交易次数：{total_trades}（买{buy_count}/卖{sell_count}）")
-    print()
-    print(f"{'代码':<10} {'买入次数':>8} {'卖出次数':>8} {'操作股数':>10}")
-    print("-" * 40)
-    for code, s in stock_stats.items():
-        print(f"{code:<10} {s['buy_count']:>8} {s['sell_count']:>8} {int(sum(s['volumes'])):>10}")
+    print(f"总交易次数：{len(trades)}（买{len(buys)}/卖{len(sells)}）")
 
 
 def cmd_backtest(args):
@@ -304,7 +337,7 @@ def main():
     al.add_argument("--id", help="提醒ID")
     al.add_argument("--enabled-only", dest="enabled_only", action="store_true")
     lg = sub.add_parser("log", help="交易记录")
-    lg.add_argument("action", choices=["add", "list", "positions", "stats"])
+    lg.add_argument("action", choices=["add", "list", "positions", "stats", "signals"])
     lg.add_argument("--stock", help="股票代码")
     lg.add_argument("--action-type", dest="action_type", choices=["buy", "sell"])
     lg.add_argument("--price", help="成交价格")
