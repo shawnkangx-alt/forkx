@@ -14,6 +14,8 @@ from .indicators import (
     macd_signal,
     ma_status,
     rsi_zone,
+    rsi_oversold_with_main_inflow,
+    rsi_overbought_duration,
 )
 
 
@@ -47,11 +49,14 @@ class Analyzer:
         # 趋势判断
         trend = self._judge_trend(ma, rsi, macd, kdj_data)
 
+        # RSI超买持续时间
+        rsi_overbought = rsi_overbought_duration(rsi_vals)
+
         # 性价比判断
         value = self._judge_value()
 
         # 综合判断
-        verdict = self._make_verdict(trend, rsi, bb, value, vol_ratio)
+        verdict = self._make_verdict(trend, rsi, bb, value, vol_ratio, rsi_overbought)
 
         return {
             "stock_code": self.rt.code,
@@ -59,6 +64,10 @@ class Analyzer:
             "date": str(latest.date),
             "price": self.rt.price,
             "pct_chg": self.rt.pct_chg,
+            "realtime_fetch_time": self.rt.fetch_time,
+            "financial_fetch_time": self.fin.fetch_time,
+            "kline_start": str(self.quotes[0].date),
+            "kline_end": str(latest.date),
             "trend": trend,
             "rsi": {
                 "value": round(rsi, 1),
@@ -70,6 +79,7 @@ class Analyzer:
             "bollinger": bb,
             "support_resistance": sr,
             "volume_ratio": vol_ratio,
+            "rsi_overbought": rsi_overbought,
             "financial": {
                 "pe": self.fin.pe,
                 "pb": self.fin.pb,
@@ -150,18 +160,32 @@ class Analyzer:
 
         return {"level": level, "comment": comment}
 
-    def _make_verdict(self, trend: Dict, rsi: float, bb: Dict, value: Dict, vol_ratio: float) -> str:
-        """综合判断：买入/持有/观望/回避。"""
+    def _make_verdict(self, trend: Dict, rsi: float, bb: Dict, value: Dict, vol_ratio: float,
+                       rsi_overbought: dict) -> str:
+        """综合判断：买入/持有/观望/回避。
+
+        新增逻辑（2026-06-25）：
+        - RSI超买持续 < 3 天 → 忽略，视为正常多头延续
+        - RSI超买持续 3-5 天 → 关注但不警示
+        - RSI超买持续 ≥ 5 天 → 警示，注意利润锁定
+        """
         trend_score = trend["score"]
         rsi_val = rsi
         bb_zone = bb.get("zone", "")
         value_level = value["level"]
+        overbought_duration = rsi_overbought.get("duration", 0)
+        overbought_alert = rsi_overbought.get("alert_level", "正常")
 
         # 风险信号
         if rsi_val > 85:
             return "观望（RSI严重超买）"
         if rsi_val < 15:
             return "观望（RSI严重超卖，可能反弹）"
+
+        # RSI超买持续时间权重（2026-06-25 新增）
+        # RSI>70 持续 ≥5 天才警示（之前被误判为空头陷阱）
+        if overbought_alert == "警示":
+            return "持有（注意利润锁定：RSI≥70持续超买）"
 
         # 买入条件
         buy_conditions = (
@@ -195,10 +219,18 @@ def format_analysis(report: Dict) -> str:
     if "error" in report:
         return f"分析失败: {report['error']}"
 
+    # 数据时间
+    rt_time = report.get("realtime_fetch_time")
+    fin_time = report.get("financial_fetch_time")
+    rt_time_str = rt_time.strftime("%m-%d %H:%M") if rt_time else "—"
+    fin_time_str = fin_time.strftime("%Y-%m-%d") if fin_time else "—"
+
     lines = [
         "=" * 50,
         f"  {report['stock_name']}（{report['stock_code']}）  {report['date']}  收盘 {report['price']}",
         "=" * 50,
+        "",
+        f"【数据】实时行情 {rt_time_str} | 日K {report.get('kline_start','?')}～{report.get('kline_end','?')} | 财务 {fin_time_str}",
         "",
         f"【价格】{report['price']} 元  涨跌幅 {report['pct_chg']:+.2f}%",
         "",
@@ -212,6 +244,17 @@ def format_analysis(report: Dict) -> str:
     ma = report["ma"]
     lines.append(f"【均线】MA5={ma['ma5']}  MA20={ma['ma20']}" + (f"  MA60={ma['ma60']}" if ma.get("ma60") else ""))
     lines.append(f"  排列：{ma['alignment']}  交叉：{ma['cross']}")
+    lines.append("")
+
+    # RSI超买持续时间
+    rsi_ob = report.get("rsi_overbought", {})
+    if rsi_ob.get("duration", 0) >= 3:
+        ob_dur = rsi_ob.get("duration", 0)
+        ob_level = rsi_ob.get("alert_level", "")
+        ob_interp = rsi_ob.get("interpretation", "")
+        lines.append(f"【RSI持续】{ob_dur}天 {ob_level} | {ob_interp}")
+    else:
+        lines.append(f"【RSI持续】{rsi_ob.get('duration', 0)}天（暂无异常）")
     lines.append("")
 
     # RSI

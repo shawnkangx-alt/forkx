@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..data.models import SignalLabel
-from .indicators import rsi_zone
+from .indicators import rsi_zone, rsi_oversold_with_main_inflow
 from .game_analyzer import (
     AuctionSignal, ConsolidationSignal, VolumePriceAnomaly,
     IntradayPattern, OrderBookPressure, GameAnalysisReport
@@ -32,8 +32,15 @@ def extract_signals_from_analysis(
     fund_flow_trend: Optional[str] = None,
     fund_flow_quality: Optional[str] = None,
     today_minutes: Optional[list] = None,
+    rsi_history: Optional[List[float]] = None,       # 2026-06-25 新增
+    main_net_flows: Optional[List[float]] = None,     # 2026-06-25 新增（万元）
 ) -> List[str]:
-    """从分析结果中提取信号标签列表。"""
+    """从分析结果中提取信号标签列表。
+
+    新增组合信号（2026-06-25）：
+    - RSI<30 + 主力连续净流入3日+ → 'RSI底背离+主力流入'
+    - RSI<30 + 主力流入不足 → 'RSI触底反弹弱'
+    """
     signals = []
 
     # === 趋势 ===
@@ -50,6 +57,14 @@ def extract_signals_from_analysis(
     # === RSI ===
     if rsi_zone_label:
         signals.append(rsi_zone_label)  # "RSI超卖" / "RSI偏弱" 等文字标签
+
+    # === RSI超卖 + 主力持续流入组合信号（2026-06-25 新增）===
+    if rsi_history and main_net_flows:
+        combo = rsi_oversold_with_main_inflow(rsi_history, main_net_flows)
+        if combo['signal'] == '强反弹信号':
+            signals.append(_label("RSI_OVERSOLD_MAIN_INFLOW"))
+        elif combo['signal'] == '弱势反弹':
+            signals.append(_label("RSI_OVERSOLD_WEAK"))
 
     # === MACD ===
     if macd_signal:
@@ -204,10 +219,14 @@ def extract_current_signals(stock_code: str) -> List[str]:
 
     # 今日分钟数据：从 records 最后一条取 hourly
     today_minutes = None
+    main_net_flows = []
     if ff and ff.records:
         last = ff.records[-1]
         if last.date == date.today() and hasattr(last, 'hourly') and last.hourly:
             today_minutes = last.hourly
+        # 提取每日主力净流入列表（万元）
+        main_net_flows = [r.main_net_wan for r in ff.records if hasattr(r, 'main_net_wan')]
+
     return extract_signals_from_analysis(
         rsi=rsi,
         ma_status=ma,
@@ -221,4 +240,6 @@ def extract_current_signals(stock_code: str) -> List[str]:
         fund_flow_trend=ff.trend if ff else None,
         fund_flow_quality=ff.quality if ff else None,
         today_minutes=today_minutes,
+        rsi_history=rsi_vals,
+        main_net_flows=main_net_flows,
     )

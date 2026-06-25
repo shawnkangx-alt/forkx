@@ -26,6 +26,8 @@ class SignalLabel(str, Enum):
     RSI_OVERBOUGHT = "RSI超买"      # RSI > 70
     RSI_WEAK = "RSI偏弱"           # RSI 30-40
     RSI_STRONG = "RSI偏强"         # RSI 60-70
+    RSI_OVERSOLD_MAIN_INFLOW = "RSI底背离+主力流入"  # RSI<30 + 主力连续净流入3日+（2026-06-25新增）
+    RSI_OVERSOLD_WEAK = "RSI触底反弹弱"              # RSI<30 + 主力流入不足，死猫跳
 
     # 资金流类
     MAIN_INFLOW_STRONG = "主力强势吸筹"   # 主力净流入且强度高
@@ -70,6 +72,7 @@ class DailyQuote:
     close: float
     volume: float  # 万手
     amount: float  # 万元
+    fetch_time: datetime = field(default_factory=datetime.now)  # 数据获取时间
 
 
 @dataclass
@@ -83,6 +86,7 @@ class FinancialReport:
     net_profit_yoy: float = 0.0
     debt_ratio: float = 0.0
     current_ratio: float = 0.0
+    fetch_time: datetime = field(default_factory=datetime.now)  # 数据获取时间
 
 
 @dataclass
@@ -100,6 +104,7 @@ class StockRealtime:
     pe: float = 0.0
     pb: float = 0.0
     pct_chg: float = 0.0  # 涨跌幅%
+    fetch_time: datetime = field(default_factory=datetime.now)  # 数据获取时间
 
 
 @dataclass

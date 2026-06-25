@@ -260,3 +260,114 @@ def calc_volume_ratio(quotes: List[DailyQuote], period: int = 20) -> float:
     avg_vol = sum(recent_vol) / len(recent_vol)
     today_vol = quotes[-1].volume
     return round(today_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+
+
+# ===== RSI 超卖+主力持续流入组合信号（2026-06-25 新增） =====
+def rsi_oversold_with_main_inflow(
+    rsi_history: List[float],
+    main_net_flows: List[float],  # 每日主力净流入（万元），时间顺序
+    rsi_threshold: float = 30.0,
+    flow_threshold: float = 500.0,   # 主力净流入 > 500万 视为"买入日"
+    consecutive_days: int = 3,
+) -> dict:
+    """RSI 超卖 + 主力连续净流入组合信号。
+
+    数据证据（2026-06-25 复盘）：
+    - 688521 RSI=17.3 时主力连续净流入 → +14.66% 强势反弹
+    - 600406 RSI=16.5 时主力持续流出 → 仅反弹到 RSI=37 无力
+    - 600188 RSI=17.3 时主力今日-5056万流出 → 继续跌
+
+    返回：
+        {
+            'signal': str,       # '强反弹信号' / '弱势反弹' / '无信号'
+            'rsi_bottom': float, # 本轮 RSI 最低值
+            'inflow_days': int,  # 主力净流入天数
+            'total_net': float,  # 累计主力净流入（万元）
+            'interpretation': str
+        }
+    """
+    if len(rsi_history) < 5 or len(main_net_flows) < 5:
+        return {'signal': '数据不足', 'rsi_bottom': 0, 'inflow_days': 0,
+                'total_net': 0, 'interpretation': '历史数据不足'}
+
+    # 取最近 N 天对齐（两者长度可能不同，取较短者）
+    n = min(len(rsi_history), len(main_net_flows))
+    rsi_slice = rsi_history[-n:]
+    flow_slice = main_net_flows[-n:]
+
+    # 找 RSI 近期最低点及其位置
+    min_rsi = min(rsi_slice)
+    min_rsi_idx = rsi_slice.index(min_rsi)
+
+    # 从最低点往右数，看之后有多少天主力净流入
+    inflow_days = sum(1 for f in flow_slice[min_rsi_idx:] if f > flow_threshold)
+    total_net = sum(flow_slice[min_rsi_idx:])
+
+    # RSI 持续超卖天数
+    oversold_days = sum(1 for r in rsi_slice[min_rsi_idx:] if r < rsi_threshold)
+
+    if min_rsi < rsi_threshold and inflow_days >= consecutive_days:
+        signal = '强反弹信号'
+        interp = (
+            f'RSI触及{min_rsi:.1f}（{oversold_days}天低于{rsi_threshold}），'
+            f'之后{min_rsi_idx}天内有{inflow_days}天主力净流入（累计{total_net:+.0f}万），反弹概率高。'
+        )
+    elif min_rsi < rsi_threshold and inflow_days > 0:
+        signal = '弱势反弹'
+        interp = (
+            f'RSI触及{min_rsi:.1f}，但之后{inflow_days}天主力净流入偏弱（累计{total_net:+.0f}万），'
+            f'反弹力度有限，可能是死猫跳。'
+        )
+    elif min_rsi < rsi_threshold:
+        signal = '无信号'
+        interp = f'RSI触及{min_rsi:.1f}，但主力未配合流入，继续观望。'
+    else:
+        signal = '无信号'
+        interp = f'RSI未触及超卖区域（最低{min_rsi:.1f}），信号未触发。'
+
+    return {
+        'signal': signal,
+        'rsi_bottom': round(min_rsi, 1),
+        'inflow_days': inflow_days,
+        'total_net': round(total_net, 0),
+        'interpretation': interp,
+    }
+
+
+# ===== RSI 超买持续时间权重（2026-06-25 新增） =====
+def rsi_overbought_duration(rsi_history: List[float], threshold: float = 70.0) -> dict:
+    """RSI 超买持续时间分析。
+
+    数据证据（2026-06-25 复盘）：
+    - 北方华创 RSI>80 持续约10天，仍继续上涨
+    - 拓荆科技 RSI>80 持续约7天
+    - 传统 RSI>80 立即卖出会错过主升浪
+
+    结论：RSI 超买持续 < 3 天可忽略，> 5 天才警示，3-5 天需结合其他指标。
+    """
+    if len(rsi_history) < 5:
+        return {'duration': 0, 'alert_level': '数据不足', 'interpretation': ''}
+
+    # 从最新往回找连续超买天数
+    duration = 0
+    for r in reversed(rsi_history):
+        if r >= threshold:
+            duration += 1
+        else:
+            break
+
+    if duration >= 5:
+        alert_level = '警示'
+        interp = f'RSI≥{threshold}已持续{duration}天，超买风险积累，注意利润锁定。'
+    elif duration >= 3:
+        alert_level = '关注'
+        interp = f'RSI≥{threshold}已持续{duration}天，多头延续中，但需留意。'
+    else:
+        alert_level = '正常'
+        interp = f'RSI≥{threshold}仅{duration}天，属正常多头延续，暂不警示。'
+
+    return {
+        'duration': duration,
+        'alert_level': alert_level,
+        'interpretation': interp,
+    }

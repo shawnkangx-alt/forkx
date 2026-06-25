@@ -27,6 +27,7 @@ class DayCompare:
     vol_ratio: float             # 量比
     vol_anomaly_type: str        # 量价异动类型
     breakout: str                # 横盘突破方向
+    is_giant_flow: bool          # 是否为异常大单日（超过均值3x）
 
 
 class CompareReport:
@@ -102,6 +103,12 @@ def compare_game_trend(code: str, days: int = 5) -> CompareReport:
             match = next((r for r in hist if r.date == d), None)
             main_net_wan = match.main_net_wan if match else 0.0
 
+        # 主力净流入均值（用于异常检测）
+        net_vals = [dc.main_net_wan for dc in day_compares]
+        avg_net = sum(net_vals) / len(net_vals) if net_vals else 0.0
+        # 异常阈值：超过均值绝对值3倍，或单日超过1万手（简化用均值*3）
+        threshold = max(abs(avg_net) * 3, 3000) if avg_net != 0 else 3000
+
         day_compares.append(DayCompare(
             date=d,
             main_net_wan=main_net_wan,
@@ -111,6 +118,7 @@ def compare_game_trend(code: str, days: int = 5) -> CompareReport:
             vol_ratio=round(vol_ratio, 2),
             vol_anomaly_type=vol_anomaly.anomaly_type if vol_anomaly else "无异动",
             breakout=consolidation.breakout_direction if consolidation.consolidation_days >= 3 else "—",
+            is_giant_flow=abs(main_net_wan) > threshold,
         ))
 
     # 今日补充实时买卖比
@@ -120,7 +128,8 @@ def compare_game_trend(code: str, days: int = 5) -> CompareReport:
             ask_total = sum(float(v) for k, v in rt.__dict__.items() if k.startswith('ask'))
             if ask_total > 0:
                 day_compares[-1] = dataclass_replace(day_compares[-1],
-                    buy_pressure_ratio=round(bid_total / ask_total, 1))
+                    buy_pressure_ratio=round(bid_total / ask_total, 1),
+                    is_giant_flow=day_compares[-1].is_giant_flow)
         except Exception:
             pass
 
@@ -183,9 +192,14 @@ def _summarize_changes(code: str, days: List[DayCompare]) -> tuple:
         direction = "高开" if recent.auction_open_pct > 0 else "低开"
         changes.append(f"竞价{direction}{abs(recent.auction_open_pct):.1f}%")
 
-    # 突破方向
+    # 横盘突破方向
     if recent.breakout not in ("—", "待定"):
         changes.append(f"横盘突破方向：{recent.breakout}")
+
+    # 异常大单日高亮
+    if recent.is_giant_flow:
+        direction = "净流入" if recent.main_net_wan > 0 else "净流出"
+        changes.append(f"◈异常大单日：{direction} {abs(recent.main_net_wan):.0f}万（超过均值3x）")
 
     # 总体判断
     buy_days = sum(1 for d in days if d.main_net_wan > 1000)
@@ -221,9 +235,13 @@ def format_compare_report(report: CompareReport) -> str:
     lines.append(f"{'':8}  " + "  ".join(f"{s:>8}" for s in date_strs))
     lines.append(f"{'-' * 56}")
 
-    # 主力净流入
-    net_vals = [f"{'▲' if d.main_net_wan > 0 else '▼' if d.main_net_wan < 0 else '―'}{abs(d.main_net_wan):>7.0f}" for d in days]
-    lines.append(f"{'主力万':8}  " + "  ".join(f"{s:>8}" for s in net_vals))
+    # 主力净流入（标注异常大单日）
+    net_vals = []
+    for d in days:
+        arrow = "▲" if d.main_net_wan > 0 else "▼" if d.main_net_wan < 0 else "―"
+        marker = "◈" if d.is_giant_flow else " "
+        net_vals.append(f"{marker}{arrow}{abs(d.main_net_wan):>7.0f}")
+    lines.append(f"{'主力万':9}  " + "  ".join(f"{s:>8}" for s in net_vals))
 
     # 买卖比
     pr_vals = [f"{d.buy_pressure_ratio:>8.1f}" if d.buy_pressure_ratio > 0 else f"{'—':>8}" for d in days]
