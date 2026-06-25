@@ -25,6 +25,7 @@ def _provider():
 
 
 def cmd_watch(args):
+    from datetime import datetime
     watchlist = load_watchlist()
     if not watchlist:
         print("自选股为空，请先用 forlsx add <股票代码> 添加")
@@ -37,8 +38,12 @@ def cmd_watch(args):
     end = datetime.today().date()
     start = end - timedelta(days=90)
     kline = prov["kline"]
+    # 取最早一只的 fetch_time 作为本次刷新时间
+    sample_rt = next((r for r in realtime.values()), None)
+    fetch_str = sample_rt.fetch_time.strftime("%m-%d %H:%M") if sample_rt and sample_rt.fetch_time else "—"
     print()
-    print(f"{'代码':<8} {'名称':<10} {'价格':>8} {'涨跌%':>8} {'RSI':>8} {'均线状态':<8} {'趋势'}")
+    print(f"自选股  (刷新 {fetch_str})")
+    print(f"代码       名称               价格      涨跌%      RSI 均线状态     趋势")
     print("-" * 70)
     for code in watchlist:
         rt = realtime.get(code)
@@ -537,6 +542,8 @@ def main():
     co.add_argument("--days", default="5", help="对比天数（默认5天）")
     pr = sub.add_parser("predict", help="次日涨跌预测")
     pr.add_argument("stock", help="股票代码")
+    se = sub.add_parser("sector", help="板块联动分析")
+    se.add_argument("--name", default="半导体", help="板块名称（默认半导体）")
     sub.add_parser("add", help="添加自选股").add_argument("stock", help="股票代码")
     sub.add_parser("remove", help="移除自选股").add_argument("stock", help="股票代码")
 
@@ -555,6 +562,13 @@ def main():
         cmd_backtest(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "sector":
+        from .screening.sector_analyzer import analyze_sector, format_sector_report
+        from .utils.watchlist import load_watchlist
+        watch = load_watchlist()
+        codes = watch  # already a list of strings
+        report = analyze_sector(sector_name=args.name, watch_codes=codes)
+        print(format_sector_report(report))
     elif args.command == "predict":
         cmd_predict(args)
     elif args.command == "add":
