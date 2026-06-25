@@ -546,6 +546,8 @@ def main():
     se.add_argument("--name", default="半导体", help="板块名称（默认半导体）")
     sub.add_parser("add", help="添加自选股").add_argument("stock", help="股票代码")
     sub.add_parser("remove", help="移除自选股").add_argument("stock", help="股票代码")
+    from .screening.trade_journal import register_trade_parser
+    register_trade_parser(sub)
 
     args = parser.parse_args()
     if args.command == "watch":
@@ -566,9 +568,12 @@ def main():
         from .screening.sector_analyzer import analyze_sector, format_sector_report
         from .utils.watchlist import load_watchlist
         watch = load_watchlist()
-        codes = watch  # already a list of strings
+        codes = watch
         report = analyze_sector(sector_name=args.name, watch_codes=codes)
         print(format_sector_report(report))
+    elif args.command == "trade":
+        from .screening.trade_journal import cmd_trade
+        cmd_trade(args)
     elif args.command == "predict":
         cmd_predict(args)
     elif args.command == "add":
